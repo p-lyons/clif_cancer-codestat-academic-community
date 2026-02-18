@@ -8,11 +8,6 @@
 
 ## Requirements
 
-### Python Dependencies
-```bash
-pip install -r requirements.txt
-```
-
 ### CLIF Tables Required
 - `clif_hospitalization.parquet` (or .csv)
 - `clif_adt.parquet`
@@ -27,6 +22,8 @@ project/
 ├── config/
 │   └── config.yaml          # Site configuration (not committed to git)
 ├── 01_cohort_code_status.py  # Main analysis script
+├── pyproject.toml            # Python dependencies
+├── uv.lock                   # Locked dependency versions
 ├── upload_to_box/            # Created automatically — poolable outputs
 ├── proj_tables/              # Created automatically — intermediate data
 └── README.md
@@ -34,13 +31,24 @@ project/
 
 ## Setup
 
-1. **Create config file:**
+1. **Install uv** (one time):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. **Clone the repo:**
+   ```bash
+   git clone git@github.com:YOUR_USERNAME/YOUR_REPO.git
+   cd YOUR_REPO
+   ```
+
+3. **Create your config file:**
    ```bash
    mkdir -p config
    cp config_template.yaml config/config.yaml
    ```
 
-2. **Edit config.yaml with your site details:**
+4. **Edit `config/config.yaml` with your site details:**
    ```yaml
    site_lowercase: "your_site"
    tables_location: "/path/to/clif/tables"
@@ -49,19 +57,21 @@ project/
    end_date: "2024-12-31"
    ```
 
-3. **Verify your CLIF tables are present:**
+5. **Verify your CLIF tables are present:**
    ```bash
    ls /path/to/your/clif/data/clif_*.parquet
    ```
 
-4. **Run the analysis:**
+6. **Run the analysis:**
    ```bash
-   python 01_cohort_code_status.py
+   uv run python 01_cohort_code_status.py
    ```
+
+   That's it. `uv run` creates the virtual environment, installs all dependencies, and executes the script in one step. Subsequent runs are instant.
 
    For batch/automated execution (exits on test failure instead of prompting):
    ```bash
-   python 01_cohort_code_status.py --no-interactive
+   uv run python 01_cohort_code_status.py --no-interactive
    ```
 
 **Expected runtime:** 5–20 minutes depending on data size.
@@ -198,11 +208,6 @@ Check that `tables_location` path is correct and contains files like `clif_hospi
 ### "Table validation failed"
 The script checks that required columns and expected values exist in each table. Review the validation error messages — they will identify the specific table and missing column or value.
 
-### "statsmodels not installed"
-```bash
-pip install statsmodels
-```
-
 ### Unit test warnings
 Review the specific warning and validate your data. Type "yes" when prompted if warnings are minor. Use `--no-interactive` for batch runs (script exits on failure).
 
@@ -229,6 +234,7 @@ For questions about analysis methods or data issues:
 ## Version History
 
 - v1.1 (2025-02-18): Revised
+  - uv for dependency management (replaces requirements.txt)
   - Fixed code status join (hospitalization_id path, not patient_id)
   - Fixed encounter linkage for overlapping encounters
   - 7-group cancer hierarchy (metastatic, heme, lung, GI/HPB, breast, GU, other solid)
