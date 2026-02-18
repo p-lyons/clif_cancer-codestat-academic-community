@@ -126,7 +126,7 @@ VALIDATION_SPECS = {
         }
     },
     'code_status': {
-        'req_vars': ['hospitalization_id', 'code_status_category', 'start_dttm'],
+        'req_vars': ['patient_id', 'code_status_category', 'start_dttm'],
         'req_values': {}
     }
 }
@@ -448,21 +448,16 @@ def get_initial_code_status(code_status_df, cohort_df, hid_jid_crosswalk,
                             logger, window_hours=12):
     """
     Extract initial code status within window of admission.
-    Joins through hospitalization_id (not patient_id) to avoid many-to-many.
+    code_status table is keyed on patient_id (not hospitalization_id),
+    so we join on patient_id and use the admission time window to assign
+    records to the correct encounter.
     """
     logger.info("--- Extracting initial code status ---")
 
-    # Join code_status to crosswalk on hospitalization_id
+    # Join on patient_id, bringing in each encounter's admission time
     codes = code_status_df.merge(
-        hid_jid_crosswalk[['hospitalization_id', 'joined_hosp_id']],
-        on='hospitalization_id',
-        how='inner'
-    )
-
-    # Bring in admission time from cohort
-    codes = codes.merge(
-        cohort_df[['joined_hosp_id', 'admission_dttm']],
-        on='joined_hosp_id',
+        cohort_df[['patient_id', 'joined_hosp_id', 'admission_dttm']],
+        on='patient_id',
         how='inner'
     )
 
@@ -472,7 +467,7 @@ def get_initial_code_status(code_status_df, cohort_df, hid_jid_crosswalk,
         (codes['start_dttm'] <= codes['admission_dttm'] + pd.Timedelta(hours=window_hours))
     ]
 
-    # Take last code status in window
+    # Take last code status in window per encounter
     codes = (codes
              .sort_values('start_dttm')
              .groupby('joined_hosp_id')['code_status_category']
