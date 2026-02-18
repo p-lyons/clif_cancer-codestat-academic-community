@@ -855,51 +855,111 @@ def run_logistic_regression(df, site, output_dir, logger):
 
 
 def generate_table1(df, site, output_dir, logger):
-    """Generate Table 1: characteristics by hospital type and cancer status"""
+    """
+    Generate Table 1 sufficient statistics for federated pooling.
+
+    Continuous: n, sum, sum_of_squares per ca_01 × hosp_type cell
+      (coordinating center computes pooled mean = Σsum/Σn,
+       pooled SD via Σsumsq, Σsum, Σn)
+
+    Categorical: n per level with n_total denominator per cell
+      (coordinating center computes pooled proportions = Σn/Σn_total)
+
+    Cancer groups: counts by cancer_group × hosp_type (cancer patients only)
+    """
     logger.info("--- Generating Table 1 ---")
 
-    strata = df.groupby(['ca_01', 'hosp_type'])
+    strata_cols = ['ca_01', 'hosp_type']
 
-    # Continuous variables
+    # ------------------------------------------------------------------
+    # Continuous variables: n, sum, sum_of_squares
+    # ------------------------------------------------------------------
     cont_vars = ['age', 'vw', 'los_hosp_d']
-    cont_summary = []
-    for var in cont_vars:
-        if var in df.columns:
-            summary = strata[var].agg(['count', 'mean', 'std', 'median'])
-            summary['variable'] = var
-            summary = summary.reset_index()
-            cont_summary.append(summary)
+    cont_rows = []
 
-    if cont_summary:
-        cont_df = pd.concat(cont_summary, ignore_index=True)
+    for var in cont_vars:
+        if var not in df.columns:
+            continue
+        agg = (df
+               .groupby(strata_cols)[var]
+               .agg(
+                   n='count',
+                   val_sum='sum',
+               )
+               .reset_index())
+        # sum of squares
+        df_sq = df[strata_cols + [var]].copy()
+        df_sq['_sq'] = df_sq[var] ** 2
+        sumsq = (df_sq
+                 .groupby(strata_cols)['_sq']
+                 .sum()
+                 .reset_index()
+                 .rename(columns={'_sq': 'val_sumsq'}))
+        agg = agg.merge(sumsq, on=strata_cols)
+        agg['variable'] = var
+        agg['site'] = site
+        cont_rows.append(agg)
+
+    if cont_rows:
+        cont_df = pd.concat(cont_rows, ignore_index=True)
+        cont_df = cont_df[['site', 'variable', 'ca_01', 'hosp_type',
+                            'n', 'val_sum', 'val_sumsq']]
         cont_df.to_csv(output_dir / f'table1_continuous_{site}.csv', index=False)
-        logger.info("✓ Saved continuous variables table")
+        logger.info("✓ Saved continuous variables table (sufficient statistics)")
     else:
         cont_df = None
 
-    # Categorical variables
-    cat_vars = ['female_01', 'nhw_01', 'dead_01', 'icu_01', 'full_code_01',
-                'code_status_imputed']
-    cat_summary = []
-    for var in cat_vars:
-        if var in df.columns:
-            counts = df.groupby(['ca_01', 'hosp_type', var]).size().reset_index(name='n')
-            counts['variable'] = var
-            cat_summary.append(counts)
+    # ------------------------------------------------------------------
+    # Categorical variables: counts per level + n_total per cell
+    # ------------------------------------------------------------------
+    cat_vars = ['female_01', 'nhw_01', 'dead_01', 'hospice_01',
+                'icu_01', 'full_code_01', 'code_status_imputed']
+    cat_rows = []
 
-    if cat_summary:
-        cat_df = pd.concat(cat_summary, ignore_index=True)
+    # Denominator: total N per ca_01 × hosp_type
+    n_total = (df
+               .groupby(strata_cols)
+               .size()
+               .reset_index(name='n_total'))
+
+    for var in cat_vars:
+        if var not in df.columns:
+            continue
+        counts = (df
+                  .groupby(strata_cols + [var])
+                  .size()
+                  .reset_index(name='n'))
+        counts = counts.merge(n_total, on=strata_cols)
+        counts['variable'] = var
+        counts['site'] = site
+        # rename the value column generically
+        counts = counts.rename(columns={var: 'level'})
+        cat_rows.append(counts)
+
+    if cat_rows:
+        cat_df = pd.concat(cat_rows, ignore_index=True)
+        cat_df = cat_df[['site', 'variable', 'level', 'ca_01', 'hosp_type',
+                          'n', 'n_total']]
         cat_df.to_csv(output_dir / f'table1_categorical_{site}.csv', index=False)
-        logger.info("✓ Saved categorical variables table")
+        logger.info("✓ Saved categorical variables table (counts with denominators)")
     else:
         cat_df = None
 
-    # Cancer group distribution table
+    # ------------------------------------------------------------------
+    # Cancer group distribution by hospital type (cancer patients only)
+    # ------------------------------------------------------------------
     if 'cancer_group_enc' in df.columns:
-        ca_group = (df[df['ca_01'] == 1]
+        ca_df = df[df['ca_01'] == 1]
+        ca_group = (ca_df
                     .groupby(['cancer_group_enc', 'hosp_type'])
                     .size()
                     .reset_index(name='n'))
+        ca_n_total = (ca_df
+                      .groupby('hosp_type')
+                      .size()
+                      .reset_index(name='n_total'))
+        ca_group = ca_group.merge(ca_n_total, on='hosp_type')
+        ca_group['site'] = site
         ca_group.to_csv(output_dir / f'cancer_groups_{site}.csv', index=False)
         logger.info("✓ Saved cancer group distribution")
 
@@ -1001,6 +1061,9 @@ def main():
     cohort['female_01'] = np.where(cohort['sex_category'].str.lower() == 'female', 1, 0)
     cohort['dead_01'] = np.where(
         cohort['discharge_category'].str.lower() == 'expired', 1, 0
+    )
+    cohort['hospice_01'] = np.where(
+        cohort['discharge_category'].str.lower() == 'hospice', 1, 0
     )
 
     # Race/ethnicity: non-Hispanic White = 1, everyone else = 0
@@ -1142,6 +1205,8 @@ def main():
         'n_metastatic': [int(analysis_df['metastatic_01'].sum())],
         'n_full_code': [int(analysis_df['full_code_01'].sum())],
         'n_code_status_imputed': [int(analysis_df['code_status_imputed'].sum())],
+        'n_dead': [int(analysis_df['dead_01'].sum())],
+        'n_hospice': [int(analysis_df['hospice_01'].sum())],
         'n_academic': [int(analysis_df['hosp_type'].sum())],
         'n_community': [int((1 - analysis_df['hosp_type']).sum())],
         'n_clusters': [analysis_df['hospital_id'].nunique()],
