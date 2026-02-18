@@ -1,0 +1,26 @@
+# ==============================================================================
+# CLIF Code Status Analysis - Site Configuration Template
+# ==============================================================================
+# INSTRUCTIONS:
+# 1. Copy this file and rename it to 'config.yaml'
+# 2. Update the fields below with your local site information
+# 3. Do NOT commit the renamed 'config.yaml' to git
+
+# Site identification (lowercase, no spaces, e.g., "kumc", "ohsu", "nw_hospital")
+site_lowercase: "your_site_name"
+
+# Absolute path to your CLIF tables
+# Example: "/data/clif/v1/" or "C:/Research/CLIF/Data"
+tables_location: "/path/to/your/clif/tables"
+
+# File type for CLIF tables
+# Options: "parquet" or "csv"
+file_type: "parquet"
+
+# Study date range (YYYY-MM-DD)
+start_date: "2018-01-01"
+end_date: "2024-12-31"
+
+# Project location for outputs (default is ".")
+# Leave as "." to output to the current project directory
+project_location: "."

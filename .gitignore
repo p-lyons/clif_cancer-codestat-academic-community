@@ -1,0 +1,27 @@
+# --- CLIF Data & Outputs (CRITICAL) ---
+# Ignore raw data tables if they are ever in the root
+clif_*.parquet
+clif_*.csv
+
+# Ignore intermediate tables containing patient data
+proj_tables/
+
+# Ignore the site-specific results (only share these manually)
+upload_to_box/
+
+# --- Configuration ---
+# Ignore your real config with local paths
+config/config.yaml
+
+# Keep the template so others can see how to set it up
+!config/config.yaml.template
+
+# --- Python / System Standard ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints
+.DS_Store
+.env
+venv/
+.venv/
+env/
