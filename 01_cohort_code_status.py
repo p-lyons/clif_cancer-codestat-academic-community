@@ -203,6 +203,15 @@ DATETIME_COLS = {
 }
 
 
+def _strip_tz(df):
+    """Remove timezone info from all datetime columns for consistent comparisons."""
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            if hasattr(df[col].dt, 'tz') and df[col].dt.tz is not None:
+                df[col] = df[col].dt.tz_localize(None)
+    return df
+
+
 def load_clif_table(tables_location, table_name, file_type, logger, columns=None):
     """Load a CLIF table with datetime parsing for CSV files"""
     filepath = tables_location / f"clif_{table_name}.{file_type}"
@@ -226,7 +235,7 @@ def load_clif_table(tables_location, table_name, file_type, logger, columns=None
             raise ValueError(f"Unsupported file type: {file_type}")
 
         logger.info(f"✓ Loaded {table_name}: {len(df):,} rows")
-        return df
+        return _strip_tz(df)
 
     except Exception as e:
         raise RuntimeError(f"Error loading {table_name}: {e}")
@@ -998,8 +1007,8 @@ def main():
     logger.info(f"Output location: {project_location}")
 
     # Study dates
-    start_date = pd.to_datetime(config.get('start_date', '2018-01-01'), utc=True)
-    end_date = pd.to_datetime(config.get('end_date', '2024-12-31'), utc=True)
+    start_date = pd.to_datetime(config.get('start_date', '2018-01-01'))
+    end_date = pd.to_datetime(config.get('end_date', '2024-12-31'))
     logger.info(f"Study period: {start_date.date()} to {end_date.date()}")
 
     # Required vital signs
