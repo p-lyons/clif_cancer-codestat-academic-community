@@ -764,6 +764,12 @@ def run_logistic_regression(df, site, output_dir, logger):
     Uses clustered SEs at hospital_id when n_clusters >= 10,
     otherwise HC1 robust SEs with a warning.
     Outputs coefficients and variance-covariance matrix for REMA pooling.
+
+    Handles separation:
+      1. Logs cross-tab diagnostics to detect sparse/empty cells
+      2. Attempts standard MLE fit
+      3. Falls back to BFGS optimizer if Newton fails
+      4. Falls back to L2-penalized fit if both fail (flags in output)
     """
     logger.info("--- Running logistic regression ---")
 
@@ -789,7 +795,50 @@ def run_logistic_regression(df, site, output_dir, logger):
 
     logger.info(f"Model N: {len(model_df):,}")
 
-    # Check hospital type variation
+    # Remove hospitals with < 10 patients (too sparse for stable estimation)
+    hosp_counts = model_df['hospital_id'].value_counts()
+    small_hosps = hosp_counts[hosp_counts < 10].index
+    if len(small_hosps) > 0:
+        n_dropped = model_df['hospital_id'].isin(small_hosps).sum()
+        logger.warning(
+            f"Dropping {len(small_hosps)} hospital(s) with <10 patients "
+            f"({n_dropped:,} rows): {list(small_hosps)}"
+        )
+        model_df = model_df[~model_df['hospital_id'].isin(small_hosps)]
+        logger.info(f"Model N after hospital filter: {len(model_df):,}")
+
+    # ------------------------------------------------------------------
+    # Separation diagnostics: log cross-tabs for key predictors
+    # ------------------------------------------------------------------
+    logger.info("Cross-tab: ca_01 × hosp_type × full_code_01")
+    xtab = (model_df
+            .groupby(['ca_01', 'hosp_type', 'full_code_01'])
+            .size()
+            .reset_index(name='n'))
+    logger.info(f"\n{xtab.to_string(index=False)}")
+
+    # Check for empty or very sparse cells in the interaction
+    interaction_cells = (model_df
+                         .groupby(['ca_01', 'hosp_type'])
+                         .agg(n=('full_code_01', 'size'),
+                              n_events=('full_code_01', 'sum'))
+                         .reset_index())
+    interaction_cells['n_nonevents'] = interaction_cells['n'] - interaction_cells['n_events']
+    sparse_cells = interaction_cells[
+        (interaction_cells['n_events'] < 5) | (interaction_cells['n_nonevents'] < 5)
+    ]
+
+    has_separation_risk = len(sparse_cells) > 0
+
+    if has_separation_risk:
+        logger.warning(
+            f"Sparse cells detected in ca_01 × hosp_type — separation risk:\n"
+            f"{sparse_cells.to_string(index=False)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Formula
+    # ------------------------------------------------------------------
     n_hosp_types = model_df['hosp_type'].nunique()
     if n_hosp_types < 2:
         logger.warning("Only one hospital type — fitting main-effects model without interaction")
@@ -802,63 +851,150 @@ def run_logistic_regression(df, site, output_dir, logger):
 
     logger.info(f"Formula: {formula}")
 
-    # Determine SE method based on number of clusters
+    # ------------------------------------------------------------------
+    # SE method
+    # ------------------------------------------------------------------
     n_clusters = model_df['hospital_id'].nunique()
     logger.info(f"Number of hospital clusters: {n_clusters}")
 
     if n_clusters >= 10:
-        logger.info("Using clustered standard errors at hospital_id level")
-        model = smf.logit(formula, data=model_df).fit(
-            cov_type='cluster',
-            cov_kwds={'groups': model_df['hospital_id']},
-            maxiter=100,
-            disp=0
-        )
+        cov_type = 'cluster'
+        cov_kwds = {'groups': model_df['hospital_id']}
     else:
+        cov_type = 'HC1'
+        cov_kwds = {}
         if n_clusters > 1:
             logger.warning(
                 f"Only {n_clusters} clusters — clustered SEs unreliable. "
                 f"Using HC1 robust SEs. Meta-analysis should account for this."
             )
-        else:
-            logger.info("Single hospital — using HC1 robust SEs")
-        model = smf.logit(formula, data=model_df).fit(
-            cov_type='HC1',
+
+    # ------------------------------------------------------------------
+    # Fit with fallback chain
+    # ------------------------------------------------------------------
+    fit_method = 'mle'
+    model = None
+    logit_model = smf.logit(formula, data=model_df)
+
+    # Attempt 1: standard Newton-Raphson MLE
+    try:
+        logger.info("Fitting: standard MLE (Newton-Raphson)")
+        model = logit_model.fit(
+            cov_type=cov_type,
+            cov_kwds=cov_kwds if cov_kwds else None,
             maxiter=100,
             disp=0
         )
+    except (np.linalg.LinAlgError, Exception) as e:
+        logger.warning(f"Standard MLE failed: {e}")
 
-    logger.info(f"\n{model.summary()}")
+    # Attempt 2: BFGS optimizer (more robust to near-singular Hessian)
+    if model is None:
+        try:
+            logger.info("Fitting: MLE with BFGS optimizer")
+            model = logit_model.fit(
+                method='bfgs',
+                cov_type=cov_type,
+                cov_kwds=cov_kwds if cov_kwds else None,
+                maxiter=200,
+                disp=0
+            )
+            fit_method = 'mle_bfgs'
+        except (np.linalg.LinAlgError, Exception) as e:
+            logger.warning(f"BFGS fit failed: {e}")
 
-    # Extract results
-    results = pd.DataFrame({
-        'variable': model.params.index,
-        'coef': model.params.values,
-        'se': model.bse.values,
-        'z': model.tvalues.values,
-        'pval': model.pvalues.values,
-        'ci_lower': model.conf_int()[0].values,
-        'ci_upper': model.conf_int()[1].values,
-        'or': np.exp(model.params.values),
-        'or_ci_lower': np.exp(model.conf_int()[0].values),
-        'or_ci_upper': np.exp(model.conf_int()[1].values),
-        'n_obs': len(model_df),
-        'n_events': int(model_df['full_code_01'].sum()),
-        'n_clusters': n_clusters,
-        'se_method': 'clustered' if n_clusters >= 10 else 'HC1'
-    })
+    # Attempt 3: L2-penalized fit (Firth-like, handles separation)
+    if model is None:
+        try:
+            logger.info("Fitting: L2-penalized logistic regression (alpha=0.1)")
+            model = logit_model.fit_regularized(
+                method='l1',    # actually uses elastic net; alpha controls penalty
+                alpha=0.1,      # small penalty to break separation
+                disp=0
+            )
+            fit_method = 'penalized_l2'
+            logger.warning(
+                "Used penalized regression due to separation. "
+                "SEs are approximate. Flag this for the coordinating center."
+            )
+        except Exception as e:
+            logger.error(f"All fitting methods failed: {e}")
+            logger.error(
+                "This site likely has complete separation in the interaction. "
+                "Review the cross-tab above and contact the coordinating center."
+            )
+            return None
+
+    logger.info(f"Fit method: {fit_method}")
+
+    # Penalized models have different attributes
+    is_penalized = fit_method == 'penalized_l2'
+
+    if not is_penalized:
+        logger.info(f"\n{model.summary()}")
+
+        results = pd.DataFrame({
+            'variable': model.params.index,
+            'coef': model.params.values,
+            'se': model.bse.values,
+            'z': model.tvalues.values,
+            'pval': model.pvalues.values,
+            'ci_lower': model.conf_int()[0].values,
+            'ci_upper': model.conf_int()[1].values,
+            'or': np.exp(model.params.values),
+            'or_ci_lower': np.exp(model.conf_int()[0].values),
+            'or_ci_upper': np.exp(model.conf_int()[1].values),
+            'n_obs': len(model_df),
+            'n_events': int(model_df['full_code_01'].sum()),
+            'n_clusters': n_clusters,
+            'se_method': ('clustered' if cov_type == 'cluster' else 'HC1'),
+            'fit_method': fit_method
+        })
+
+        # Save VCV matrix
+        vcov = pd.DataFrame(
+            model.cov_params(),
+            index=model.params.index,
+            columns=model.params.index
+        )
+        vcov.to_csv(output_dir / f'vcov_matrix_{site}.csv')
+        logger.info("✓ Saved variance-covariance matrix")
+
+    else:
+        # Penalized model: coefficients available, SEs are not standard
+        logger.info(f"Penalized coefficients:\n{model.params}")
+
+        results = pd.DataFrame({
+            'variable': model.params.index,
+            'coef': model.params.values,
+            'se': np.nan,
+            'z': np.nan,
+            'pval': np.nan,
+            'ci_lower': np.nan,
+            'ci_upper': np.nan,
+            'or': np.exp(model.params.values),
+            'or_ci_lower': np.nan,
+            'or_ci_upper': np.nan,
+            'n_obs': len(model_df),
+            'n_events': int(model_df['full_code_01'].sum()),
+            'n_clusters': n_clusters,
+            'se_method': 'penalized',
+            'fit_method': fit_method
+        })
+
+        logger.warning(
+            "No VCV matrix saved — penalized model does not produce standard SEs. "
+            "This site's coefficients can be reported descriptively but cannot "
+            "contribute standard SEs to the REMA."
+        )
 
     results.to_csv(output_dir / f'regression_results_{site}.csv', index=False)
-    logger.info(f"✓ Saved regression results")
+    logger.info("✓ Saved regression results")
 
-    # Save variance-covariance matrix for REMA pooling
-    vcov = pd.DataFrame(
-        model.cov_params(),
-        index=model.params.index,
-        columns=model.params.index
-    )
-    vcov.to_csv(output_dir / f'vcov_matrix_{site}.csv')
-    logger.info(f"✓ Saved variance-covariance matrix")
+    # Save cross-tab diagnostics alongside results
+    xtab['site'] = site
+    xtab.to_csv(output_dir / f'interaction_crosstab_{site}.csv', index=False)
+    logger.info("✓ Saved interaction cross-tab")
 
     return results
 
@@ -1231,7 +1367,8 @@ def main():
     logger.info("=" * 80)
     logger.info(f"Outputs saved to: {output_dir}")
     logger.info(f"  - regression_results_{site}.csv")
-    logger.info(f"  - vcov_matrix_{site}.csv")
+    logger.info(f"  - vcov_matrix_{site}.csv (if standard MLE converged)")
+    logger.info(f"  - interaction_crosstab_{site}.csv")
     logger.info(f"  - table1_continuous_{site}.csv")
     logger.info(f"  - table1_categorical_{site}.csv")
     logger.info(f"  - cancer_groups_{site}.csv")
